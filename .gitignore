@@ -1,0 +1,20 @@
+# Exclude environment files
+venc/
+.env
+
+# Exclude data folder (unless needed)
+data/
+
+# Python cache & logs
+__pycache__/
+*.pyc
+*.pyo
+*.log
+
+# Ignore local IDE settings
+.vscode/
+.idea/
+.DS_Store
+
+# Ignore Docker build files (if large)
+*.tar
