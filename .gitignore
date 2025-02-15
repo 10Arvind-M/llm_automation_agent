@@ -19,3 +19,7 @@ __pycache__/
 # Ignore Docker build files (if large)
 *.tar
 datagen.py
+evaluate.py
+debugger.py
+output.txt
+credit_card.txt
