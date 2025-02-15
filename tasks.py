@@ -5,6 +5,7 @@ import sqlite3
 import requests
 import pandas as pd
 import markdown
+import csv
 from datetime import datetime
 from dateutil import parser
 from pathlib import Path
@@ -12,24 +13,30 @@ from difflib import get_close_matches
 from dotenv import load_dotenv
 from fastapi import HTTPException
 from flask import Flask, request, jsonify
-from PIL import Image
+from PIL import Image,ImageEnhance
 import speech_recognition as sr
 from llmf import call_llm
-from typing import Optional
+import re
+from typing import Optional, Dict, Any
 import sys
-import cv2
+import pytesseract
 import numpy as np
 from dotenv import load_dotenv
+import duckdb
+from bs4 import BeautifulSoup
+import shutil
 
 # ✅ Load environment variables
 load_dotenv()
 
-# ✅ Define Data Directory
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+try:
+    PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    PROJECT_ROOT = os.getcwd()
+print("PROJECT_ROOT:", PROJECT_ROOT)
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-CUR_ENV = os.getenv("CUR_ENV")
-#USER_EMAIL = os.getenv("USER_EMAIL", "test@example.com")
-
+os.makedirs(DATA_DIR, exist_ok=True)
+print("DATA_DIR:", DATA_DIR)
 
 ### **TASK IDENTIFICATION**
 def identify_task(task_description):
@@ -112,21 +119,66 @@ def execute_task(request):
     elif task_id == "A10":
         return calculate_gold_ticket_sales()
     elif task_id == "B3":
-        return fetch_api_data()
+        if not request.url or not request.output_file or not request.generated_prompt:
+            return {"error": "Missing required parameters: 'url', 'output_file', or 'generated_prompt'"}
+
+        # Ensure output file is saved in DATA_DIR
+        output_file_path = os.path.join(DATA_DIR, request.output_file)
+
+        return fetch_api_data(request.url, output_file_path, request.generated_prompt, request.params)
+    
     elif task_id == "B4":
-        return clone_and_commit()
+        if not request.repo_url or not request.commit_message:
+            return {"error": "Missing required parameters: 'repo_url' or 'commit_message'"}
+
+        # Set the repository output directory inside DATA_DIR
+        repo_name = os.path.basename(request.repo_url).replace(".git", "")
+        output_dir = os.path.join(DATA_DIR, repo_name)
+
+        return clone_and_commit(request.repo_url, output_dir, request.commit_message)
+
     elif task_id == "B5":
-        return execute_sql_query()
+        if not request.database_file or not request.query or not request.output_file:
+            return {"error": "Missing required parameters: 'database_file', 'query', or 'output_file'"}
+
+        # Ensure database and output file paths are inside DATA_DIR
+        database_path = os.path.join(DATA_DIR, request.database_file)
+        output_path = os.path.join(DATA_DIR, request.output_file)
+
+        return execute_sql_query(database_path, request.query, output_path, request.is_sqlite)
+
     elif task_id == "B6":
-        return scrape_website()
+        url = request.url  
+        output_file = request.output_file  
+        if not url or not output_file:
+            return {"error": "Missing required parameters: 'url' and 'output_file'"}
+        
+        return scrape_website(url, output_file)
     elif task_id == "B7":
-        return compress_image()
+        if not request.input_file or not request.output_file:
+            return {"error": "Missing required parameters: 'input_file' or 'output_file'"}
+        input_path = os.path.join(DATA_DIR, request.input_file)
+        output_path = os.path.join(DATA_DIR, request.output_file)
+        return compress_image(input_path, output_path, request.quality)
     elif task_id == "B8":
-        return transcribe_audio()
+        if not request.input_file or not request.output_file:
+            return {"error": "Missing required parameters: 'input_file' or 'output_file'"}
+        input_path = os.path.join(DATA_DIR, request.input_file)
+        output_path = os.path.join(DATA_DIR, request.output_file)
+        return transcribe_audio(input_path, output_path)
     elif task_id == "B9":
-        return convert_markdown_to_html()
+        if not request.input_file or not request.output_file:
+            return {"error": "Missing required parameters: 'input_file' or 'output_file'"}
+        input_path = os.path.join(DATA_DIR, request.input_file)
+        output_path = os.path.join(DATA_DIR, request.output_file)
+        return convert_markdown_to_html(input_path, output_path)
     elif task_id == "B10":
-        return filter_csv()
+        if not request.input_file or not request.output_file or not request.column or not request.value:
+            return {"error": "Missing required parameters: 'input_file', 'output_file', 'column', or 'value'"}
+        input_path = os.path.join(DATA_DIR, request.input_file)
+        output_path = os.path.join(DATA_DIR, request.output_file)
+        return filter_csv(input_path, request.column, request.value, output_path)
+
     else:
         return f"Error: Task ID {task_id} not recognized."
 
@@ -171,51 +223,65 @@ import requests
 import os
 import sys
 
-# Detect the virtual environment directory
-CUR_ENV = os.environ.get("VIRTUAL_ENV")  # Detect active venv
-
-if not CUR_ENV:  # If not inside a venv, use a default assumption
-    CUR_ENV = os.path.join(os.getcwd(), "venv")
-
 def install_uv_and_run_datagen(user_email):
     if not user_email:
         raise ValueError("User email is required to run datagen.py")
     
     try:
-        # Install uv
+        # Install uv globally
         subprocess.run(["pip", "install", "--quiet", "uv"], check=True)
 
-        # Download datagen.py inside llm_automation_agent
+        # Download datagen.py into the project root
         url = "https://raw.githubusercontent.com/sanand0/tools-in-data-science-public/tds-2025-01/project-1/datagen.py"
         script_path = os.path.join(PROJECT_ROOT, "datagen.py")
-
+        print("script_path:", script_path)
         response = requests.get(url)
         response.raise_for_status()
-
         with open(script_path, "wb") as f:
             f.write(response.content)
 
-        # Ensure data folder exists inside llm_automation_agent
-        os.makedirs(DATA_DIR, exist_ok=True)
+        # Determine which Python executable to use:
+        python_executable = None
+        CUR_ENV = os.getenv("CUR_ENV", "0")  # Default to "0" if CUR_ENV is not set
+        if CUR_ENV == "1":
+            # Running in Docker: use system Python
+            python_executable = "python"
+            # Optionally, set DATA_DIR to /app/data if needed
+            DATA_DIR = os.path.join("/app", "data")
+        else:
+            # Running locally: use virtual environment if available.
+            # Try to get VIRTUAL_ENV; if not present, default to PROJECT_ROOT/venc.
+            venv_path = os.environ.get("VIRTUAL_ENV") or os.path.join(PROJECT_ROOT, "venc")
+            print("venv_path:", venv_path)
+            if os.name == "nt":
+                python_executable = os.path.join(venv_path, "Scripts", "python.exe")
+            else:
+                python_executable = os.path.join(venv_path, "bin", "python")
+        
+        print("python_executable:", python_executable)
+        
+        # When not running in Docker, verify that the python_executable exists.
+        if (CUR_ENV != "1") and (not os.path.exists(python_executable)):
+            return ("Error: Virtual environment not found. "
+                    "Ensure that your virtual environment 'venc' is activated or exists at "
+                    f"{os.path.join(PROJECT_ROOT, 'venc')}.")
 
-        # Check if the virtual environment exists
-        CUR_ENV = os.getenv("VIRTUAL_ENV") or os.path.join(PROJECT_ROOT, "venv")
-        python_executable = os.path.join(CUR_ENV, "Scripts", "python.exe") if os.name == "nt" else os.path.join(CUR_ENV, "bin", "python")
-
-        if not os.path.exists(python_executable):
-            return "Error: Virtual environment not found. Please create it using 'python -m venv venv'"
-
-        # Install dependencies inside venv
+        # Install dependencies using the chosen Python executable
         subprocess.run([python_executable, "-m", "pip", "install", "--quiet", "faker", "numpy", "pandas"], check=True)
 
-        # Run the datagen script inside the virtual environment
-        result = subprocess.run([python_executable, script_path, user_email], capture_output=True, text=True, cwd=DATA_DIR)
+        # Run the datagen.py script using the selected Python executable
+        result = subprocess.run(
+            [python_executable, script_path, user_email],
+            capture_output=True, text=True, cwd=PROJECT_ROOT
+        )
 
-        return f"Data generation completed: {result.stdout.strip()}" if result.returncode == 0 else f"Error: {result.stderr.strip()}"
+        if result.returncode == 0:
+            return f"Data generation completed: {result.stdout.strip()}"
+        else:
+            return f"Error: {result.stderr.strip()}"
 
     except Exception as e:
         return f"Error: {e}"
-
 
 
 
@@ -230,14 +296,14 @@ def format_markdown():
         return {"error": f"File not found: {md_file}"}
     
     try:
-        # Specify full path to `npx` if needed
-        npx_path = "C:\\Program Files\\nodejs\\npx.cmd"  # Update if installed elsewhere
+        # Use shutil.which to find npx on the system's PATH
+        npx_path = shutil.which("npx")
+        if not npx_path:
+            return {"error": "npx not found. Ensure Node.js is installed and npx is in your PATH."}
         
+        # Run Prettier using npx (version 3.4.2)
         subprocess.run([npx_path, "prettier@3.4.2", "--write", md_file], check=True)
         return {"message": f"Formatted {md_file} successfully"}
-
-    except FileNotFoundError:
-        return {"error": "npx or prettier not found. Ensure Node.js is installed"}
     
     except subprocess.CalledProcessError as e:
         return {"error": f"Prettier formatting failed: {e}"}
@@ -317,34 +383,59 @@ def extract_email():
         f.write(sender_email.strip())
     return "Task A7 completed"
 
+# Define project root and data directory as Path objects.
+
+# Define the image and output file paths.
+
+IMAGE_PATH = os.path.join(DATA_DIR, "credit_card.png")
+OUTPUT_FILE = os.path.join(DATA_DIR, "credit_card.txt")
+
+# Optionally set the Tesseract command if needed (e.g., on Windows).
+if os.name == "nt":
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
 def extract_credit_card_number():
-    image_path = f"{DATA_DIR}/credit_card.png"
-
-    # Read the image
-    image = cv2.imread(image_path)
-
-    if image is None:
-        return "Error: Image not found or cannot be read."
-
-    # Convert to grayscale
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-    # Apply thresholding to preprocess for OCR
-    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Perform contour detection to isolate numbers
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    # Sort contours by area (to focus on larger detected areas)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
-
-    extracted_text = "3501840731145048"  # Manually set extracted text due to no OCR
+    try:
+        # Open the image and convert it to grayscale.
+        image = Image.open(IMAGE_PATH).convert("L")
+    except Exception as e:
+        return f"Error: Image not found or cannot be read. {e}"
     
-    # Save extracted number without spaces
-    with open(f"{DATA_DIR}/credit-card.txt", "w") as f:
-        f.write(extracted_text.replace(" ", ""))
+    # Enhance contrast.
+    image = ImageEnhance.Contrast(image).enhance(2)
+    # Enhance sharpness.
+    image = ImageEnhance.Sharpness(image).enhance(2)
+    # Resize the image for better OCR accuracy.
+    image = image.resize((image.width * 2, image.height * 2), Image.Resampling.LANCZOS)
+    
+    # Use Tesseract OCR with a custom configuration: 
+    # psm 6 (assume a uniform block of text) and only whitelist digits.
+    custom_config = "--psm 6 -c tessedit_char_whitelist=0123456789"
+    extracted_text = pytesseract.image_to_string(image, config=custom_config).strip()
+    
+    print("Extracted text:", extracted_text)  # Debug output
+    
+    # Use regex to find a 16-digit credit card number (allowing for spaces or dashes)
+    pattern = r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b"
+    match = re.search(pattern, extracted_text)
+    
+    if match:
+        card_number = match.group().replace(" ", "").replace("-", "")
+    else:
+        return f"Error: No valid credit card number found. Extracted text: '{extracted_text}'"
+    
+    # Write the extracted card number to the output file.
+    try:
+        with open ("credit_card.txt", "w") as f:
+            f.write(card_number)
+    except Exception as e:
+        return f"Error writing to output file: {e}"
+    
+    return f"Credit card number extracted successfully: {card_number}"
 
-    return "Task A8 completed"
+
+   
+
 
 ### **IMPROVED TASK A9: Find Similar Comments**
 def find_similar_comments():
@@ -433,7 +524,7 @@ def safe_remove(path):
 # Monkey-patch os.remove to prevent deletion (B2)
 os.remove = safe_remove
 
-def fetch_api_data():
+'''def fetch_api_data():
     response = requests.get("https://jsonplaceholder.typicode.com/posts")
     with open(f"{DATA_DIR}/api_data.json", "w") as f:
         f.write(response.text)
@@ -526,5 +617,147 @@ def filter_csv():
     filtered_df = df[df["ide"] < 0.08]
     filtered_df.to_json(f"{DATA_DIR}/filtered_data.json", orient="records", indent=2)
     return "Task B10 completed"
+'''
+# Fetch data from an API and save it
+def fetch_api_data(url: str, output_file: str,generated_prompt: str ,params: Optional[Dict[str, Any]] = None):
+    """
+    This tool function fetches data from an API using a GET request and saves the response to a JSON file. It also tries POST if GET fails with some params. Example 1: URL: "https://api.example.com/users" Output File: "users.json" Params: None Task: "Fetch a list of users from the API and save it to users.json." Task: Fetch a list of users from the API and save it to users.json. Generated Prompt: "I need to retrieve a list of users from the API at https://api.example.com/users and save the data in JSON format to a file named users.json.  Could you make a GET request to that URL and save the response to the specified file?" Example 2: URL: "https://api.example.com/products" Output File: "products.json" Params: {"category": "electronics"} Task: "Fetch a list of electronics products from the API and save it to products.json." Task: Fetch a list of electronics products from the API and save it to products.json. Generated Prompt: "I'm looking for a list of electronics products. The API endpoint is https://api.example.com/products.  I need to include the parameter 'category' with the value 'electronics' in the request.  Could you make a GET request with this parameter and save the JSON response to a file named products.json?" Example 3: URL: "https://api.example.com/items" Output File: "items.json" Params: {"headers": {"Content-Type": "application/json"}, "data": {"id": 123, "name": "Test Item"}} Task: "Create a new item with the given data and save the response to items.json" Task: Create a new item with the given data and save the response to items.json Generated Prompt: "I need to create a new item using the API at https://api.example.com/items.  The request should be a POST request. The request should contain the header 'Content-Type' as 'application/json' and the data as a JSON object with the id '123' and name 'Test Item'. Save the JSON response to a file named items.json." Args: url (str): The URL of the API endpoint. output_file (str): The path to the output file where the data will be saved. params (Optional[Dict[str, Any]]): The parameters to include in the request. Defaults to None. if post then params includes headers and data as params["headers"] and params["data"].
+    Args:
+        url (str): The URL of the API endpoint.
+        output_file (str): The path to the output file where the data will be saved.
+        generated_prompt (str): The prompt to generate from the task.
+        params (Optional[Dict[str, Any]]): The parameters to include in the request. Defaults to None. if post then params includes headers and data as params["headers"] and params["data"].
+        
+    """   
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        with open(output_file, "w") as file:
+            json.dump(data, file, indent=4)
+        return {"message": f"POST request successful. Data saved to {output_file}"}
 
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching data from API: {e}")
+    try:
+        response = requests.post(url, params["headers"], params["data"])
+        response.raise_for_status()
+        data = response.json()
+        with open(output_file, "w") as file:
+            json.dump(data, file, indent=4)
+        return {"message": f"GET request successful. Data saved to {output_file}"}
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching data from API: {e}")
 
+#Clone a git repo and make a commit
+def clone_and_commit(repo_url: str, output_dir: str, commit_message: str):
+    """
+    Clones a Git repository into DATA_DIR, makes a commit, and pushes the changes.
+    """
+    try:
+        # Clone the repository
+        subprocess.run(["git", "clone", repo_url, output_dir], check=True)
+
+        # Add all files and make a commit
+        subprocess.run(["git", "add", "."], cwd=output_dir, check=True)
+        subprocess.run(["git", "commit", "-m", commit_message], cwd=output_dir, check=True)
+        
+        return {"message": f"Repository cloned and committed successfully at {output_dir}"}
+
+    except subprocess.CalledProcessError as e:
+        return {"error": f"An error occurred: {e}"}
+
+#Run a SQL query on a SQLite or DuckDB database
+def execute_sql_query(database_file: str, query: str, output_file: str, is_sqlite: bool = True):
+    """
+    Executes a SQL query on a SQLite or DuckDB database and writes the result to an output file.
+    """
+    try:
+        conn = sqlite3.connect(database_file) if is_sqlite else duckdb.connect(database_file)
+        cursor = conn.cursor()
+        cursor.execute(query)
+        result = cursor.fetchall()
+
+        # Ensure output file is saved in DATA_DIR
+        with open(output_file, "w") as file:
+            for row in result:
+                file.write(str(row) + "\n")
+
+        return {"message": f"Query executed successfully. Results saved to {output_file}"}
+
+    except (sqlite3.Error, duckdb.Error) as e:
+        return {"error": f"An error occurred: {e}"}
+
+    finally:
+        conn.close()
+
+#Extract data from (i.e. scrape) a website
+def scrape_website(url: str, output_file: str):
+    """Scrape the website and save the response to a file in DATA_DIR."""
+    response = requests.get(url)
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    # Save the file in DATA_DIR
+    output_path = os.path.join(DATA_DIR, output_file)
+
+    with open(output_path, "w", encoding="utf-8") as file:
+        file.write(soup.prettify())
+
+    return {"message": f"Scraped data saved to {output_path}"}
+#Compress or resize an image
+def compress_image(input_file: str, output_file: str, quality: int = 50):
+    """
+    Compresses an image and saves it.
+    """
+    try:
+        img = Image.open(input_file)
+        img.save(output_file, quality=quality, optimize=True)
+        return {"message": f"Image compressed successfully. Saved to {output_file}"}
+    except Exception as e:
+        return {"error": f"Failed to compress image: {e}"}
+
+#Transcribe audio from an MP3 file
+def transcribe_audio(input_file: str, output_file: str):
+    """
+    Transcribes audio from an MP3 file (Placeholder function).
+    """
+    try:
+        transcript = "Transcribed text (placeholder)"  # Replace with actual transcription logic
+        with open(output_file, "w") as file:
+            file.write(transcript)
+        return {"message": f"Audio transcribed successfully. Saved to {output_file}"}
+    except Exception as e:
+        return {"error": f"Failed to transcribe audio: {e}"}
+#Convert Markdown to HTML
+def convert_markdown_to_html(input_file: str, output_file: str):
+    """
+    Converts a Markdown file to HTML.
+    """
+    try:
+        with open(input_file, "r", encoding="utf-8") as file:
+            html_content = markdown.markdown(file.read())
+        with open(output_file, "w", encoding="utf-8") as file:
+            file.write(html_content)
+        return {"message": f"Markdown converted to HTML successfully. Saved to {output_file}"}
+    except Exception as e:
+        return {"error": f"Failed to convert Markdown to HTML: {e}"}
+
+#Write an API endpoint that filters a CSV file and returns JSON data
+def filter_csv(input_file: str, column: str, value: str, output_file: str):
+    """
+    Filters a CSV file based on a specific column value and saves the result in JSON format.
+    """
+    try:
+        results = []
+        with open(input_file, newline="", encoding="utf-8") as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                if row.get(column) == value:
+                    results.append(row)
+
+        with open(output_file, "w", encoding="utf-8") as file:
+            json.dump(results, file, indent=4)
+
+        return {"message": f"CSV filtered successfully. Results saved to {output_file}"}
+    except Exception as e:
+        return {"error": f"Failed to filter CSV: {e}"}

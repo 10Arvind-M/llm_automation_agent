@@ -2,4 +2,3 @@ venc/
 __pycache__/
 *.pyc
 *.pyo
-data/

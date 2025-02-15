@@ -10,12 +10,15 @@ duckdb
 pandas
 markdown
 pydub
-pyaudio
 flask
 torch
 pathlib
 gitpython
 numpy
 speechrecognition
-pyaudio
 faker
+numpy==1.23.5
+pandas
+pytesseract
+nodeenv
+

@@ -5,6 +5,7 @@ import utilsf
 import os
 from dotenv import load_dotenv
 from pydantic import BaseModel  # ✅ Ensure request body parsing
+from typing import Optional, Dict, Any
 
 # ✅ Load environment variables
 load_dotenv()
@@ -17,6 +18,22 @@ app = FastAPI()
 class TaskRequest(BaseModel):
     task: str
     body: str | None = None
+    url: str | None = None
+    output_file: str | None = None
+    generated_prompt: str | None = None
+    params: Optional[Dict[str, Any]] = None
+    repo_url: Optional[str] = None
+    output_dir: Optional[str] = None
+    commit_message: Optional[str] = None
+    query: Optional[str] = None
+    is_sqlite: Optional[bool] = True
+    database_file: Optional[str] = None
+    input_file: Optional[str] = None
+    quality: Optional[int] = 50  # For image compression
+    column: Optional[str] = None  # For CSV filtering
+    value: Optional[str] = None
+    file_path: Optional[str] = None
+
 
 
 @app.post("/run")
